@@ -6,11 +6,21 @@ The bucket, custom domain and CORS are defined in [sharosoo/infra](https://githu
 
 ## Install
 
+Single static binary (Go, no runtime) for Linux/macOS/Windows on amd64/arm64, hosted on the CDN itself:
+
 ```sh
-uv tool install --editable ~/workspaces/sharosoo/cdn
+curl -fsSL https://cdn.sharosoo.com/tools/cdn/install.sh | sh     # → ~/.local/bin/cdn
+CDN_VERSION=0.2.0 CDN_INSTALL_DIR=/usr/local/bin sh -c "$(curl -fsSL https://cdn.sharosoo.com/tools/cdn/install.sh)"
 ```
 
-No runtime dependencies (Python ≥ 3.11 stdlib). Authentication reuses the wrangler OAuth login (`bunx wrangler login`); an expired token is refreshed by running wrangler once. Set `CDN_CLOUDFLARE_API_TOKEN` to use a scoped API token instead (CI, other machines).
+The installer picks `cdn-<os>-<arch>` from `https://cdn.sharosoo.com/tools/cdn/v<version>/` and checks it against `SHA256SUMS`. Windows: download `cdn-windows-amd64.exe` from the same directory.
+
+From a checkout: `go build -o ~/.local/bin/cdn .`.
+
+### Authentication
+
+1. `CDN_CLOUDFLARE_API_TOKEN`: a Cloudflare API token with *Workers R2 Storage: Edit* on account `93b84e89…`. Use this on servers, CI and machines without wrangler.
+2. Otherwise the wrangler OAuth login (`bunx wrangler login`). An expired token is refreshed by running wrangler once (`bunx` or `npx` must be on `PATH`).
 
 ## Usage
 
@@ -34,7 +44,7 @@ cdn rm my-article/fig.png --yes
 |Key present, different content|error; `--force` overwrites|
 |Directory input|every file below it, `.git`/`__pycache__`/`.DS_Store` skipped|
 
-Objects get `Cache-Control: public, max-age=31536000, immutable` (override with `--cache-control`). Treat keys as immutable: publish changed content under a new key. `Content-Type` comes from the extension (`webp`, `avif`, `svg`, `woff2`, `md` covered); text types get `charset=utf-8`.
+Objects get `Cache-Control: public, max-age=31536000, immutable` (override with `--cache-control`). Treat keys as immutable: publish changed content under a new key. The same applies after `cdn rm`: re-uploading a deleted key can serve the old bytes from the edge cache. `Content-Type` comes from the extension (`webp`, `avif`, `svg`, `woff2`, `md` covered); text types get `charset=utf-8`.
 
 `cdn rewrite` maps these legacy URLs to `https://cdn.sharosoo.com/<path>`:
 
@@ -50,6 +60,14 @@ Objects get `Cache-Control: public, max-age=31536000, immutable` (override with 
 |`CDN_ACCOUNT_ID`|`93b84e890d66e1c2c6890b27c1e3b96b`|
 |`CDN_BUCKET`|`sharosoo-cdn`|
 |`CDN_BASE_URL`|`https://cdn.sharosoo.com`|
+
+## Release
+
+```sh
+scripts/release.sh 0.3.0
+```
+
+Needs a clean tree. Runs `go vet` and `go test`, cross-builds six targets with `CGO_ENABLED=0`, uploads them with the freshly built binary to `tools/cdn/v<version>/` plus `SHA256SUMS`, updates `tools/cdn/latest` and `tools/cdn/install.sh` (60 s cache), then tags and pushes `v<version>`.
 
 ## For agents
 

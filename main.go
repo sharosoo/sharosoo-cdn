@@ -1,0 +1,715 @@
+// Command cdn uploads files to the R2 bucket sharosoo-cdn and prints their https://cdn.sharosoo.com URLs.
+package main
+
+import (
+	"bufio"
+	"bytes"
+	"crypto/md5"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"mime"
+	"net/http"
+	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	flag "github.com/spf13/pflag"
+)
+
+var version = "dev"
+
+const (
+	defaultAccountID    = "93b84e890d66e1c2c6890b27c1e3b96b"
+	defaultBucket       = "sharosoo-cdn"
+	defaultBaseURL      = "https://cdn.sharosoo.com"
+	defaultCacheControl = "public, max-age=31536000, immutable"
+	// Cloudflare REST object upload limit; larger files need the S3 API multipart upload.
+	maxUploadBytes = 300 << 20
+	// Cloudflare bot protection rejects some default client user agents with 403.
+	userAgent = "sharosoo-cdn"
+)
+
+var (
+	accountID = envOr("CDN_ACCOUNT_ID", defaultAccountID)
+	bucket    = envOr("CDN_BUCKET", defaultBucket)
+	baseURL   = strings.TrimRight(envOr("CDN_BASE_URL", defaultBaseURL), "/")
+	apiBase   = fmt.Sprintf("https://api.cloudflare.com/client/v4/accounts/%s/r2/buckets/%s", accountID, bucket)
+
+	skipNames = map[string]bool{".git": true, ".DS_Store": true, "Thumbs.db": true, "__pycache__": true}
+
+	extraTypes = map[string]string{
+		".webp": "image/webp", ".avif": "image/avif", ".svg": "image/svg+xml",
+		".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif",
+		".woff2": "font/woff2", ".woff": "font/woff", ".ttf": "font/ttf", ".otf": "font/otf",
+		".md": "text/markdown", ".txt": "text/plain", ".html": "text/html", ".css": "text/css",
+		".js": "text/javascript", ".mjs": "text/javascript", ".json": "application/json",
+		".sh": "text/x-shellscript", ".pdf": "application/pdf",
+		".mp4": "video/mp4", ".webm": "video/webm",
+	}
+	textPrefixes = []string{"text/", "application/json", "application/javascript", "image/svg+xml"}
+
+	legacyURL = regexp.MustCompile(`https://(?:` +
+		`cdn\.jsdelivr\.net/gh/sharosoo/image@[^/\s"')]+/` +
+		`|raw\.githubusercontent\.com/sharosoo/image/(?:refs/heads/)?[^/\s"')]+/` +
+		`|github\.com/sharosoo/image/(?:raw|blob)/[^/\s"')]+/` +
+		`)`)
+)
+
+func envOr(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
+
+func wranglerConfigPath() string {
+	home, _ := os.UserHomeDir()
+	var dirs []string
+	if x := os.Getenv("XDG_CONFIG_HOME"); x != "" {
+		dirs = append(dirs, x)
+	}
+	dirs = append(dirs, filepath.Join(home, ".config"), filepath.Join(home, "Library", "Preferences"))
+	if a := os.Getenv("APPDATA"); a != "" {
+		dirs = append(dirs, a)
+	}
+	dirs = append(dirs, home)
+	for _, d := range dirs {
+		p := filepath.Join(d, ".wrangler", "config", "default.toml")
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	return ""
+}
+
+// readWranglerConfig parses the flat `key = "value"` lines wrangler writes.
+func readWranglerConfig(p string) (map[string]string, error) {
+	f, err := os.Open(p)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	out := map[string]string{}
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		k, v, ok := strings.Cut(sc.Text(), "=")
+		if !ok {
+			continue
+		}
+		v = strings.TrimSpace(v)
+		if s, err := strconv.Unquote(v); err == nil {
+			out[strings.TrimSpace(k)] = s
+		}
+	}
+	return out, sc.Err()
+}
+
+func refreshWranglerLogin() error {
+	// Any authenticated wrangler call rotates an expired OAuth token and rewrites the config file.
+	for _, runner := range [][]string{{"bunx", "wrangler"}, {"npx", "--yes", "wrangler"}} {
+		if _, err := exec.LookPath(runner[0]); err != nil {
+			continue
+		}
+		cmd := exec.Command(runner[0], append(runner[1:], "r2", "bucket", "list")...)
+		cmd.Env = append(os.Environ(), "CLOUDFLARE_ACCOUNT_ID="+accountID)
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("wrangler token refresh failed (run: bunx wrangler login)\n%s", strings.TrimSpace(stderr.String()))
+		}
+		return nil
+	}
+	return errors.New("wrangler token expired and neither bunx nor npx is available to refresh it")
+}
+
+func apiToken() (string, error) {
+	if t := os.Getenv("CDN_CLOUDFLARE_API_TOKEN"); t != "" {
+		return t, nil
+	}
+	p := wranglerConfigPath()
+	if p == "" {
+		return "", errors.New("no CDN_CLOUDFLARE_API_TOKEN and no wrangler login (run: bunx wrangler login)")
+	}
+	cfg, err := readWranglerConfig(p)
+	if err != nil {
+		return "", err
+	}
+	expires, err := time.Parse(time.RFC3339, cfg["expiration_time"])
+	if err != nil || time.Until(expires) < 2*time.Minute {
+		if err := refreshWranglerLogin(); err != nil {
+			return "", err
+		}
+		if cfg, err = readWranglerConfig(p); err != nil {
+			return "", err
+		}
+	}
+	if cfg["oauth_token"] == "" {
+		return "", fmt.Errorf("no oauth_token in %s (run: bunx wrangler login)", p)
+	}
+	return cfg["oauth_token"], nil
+}
+
+type r2Client struct {
+	token string
+	http  *http.Client
+}
+
+type r2Object struct {
+	Key          string          `json:"key"`
+	ETag         string          `json:"etag"`
+	Size         json.RawMessage `json:"size"`
+	LastModified string          `json:"last_modified"`
+}
+
+func (o r2Object) bytes() int64 {
+	s := strings.Trim(string(o.Size), `"`)
+	n, _ := strconv.ParseInt(s, 10, 64)
+	return n
+}
+
+func newR2() (*r2Client, error) {
+	t, err := apiToken()
+	if err != nil {
+		return nil, err
+	}
+	return &r2Client{token: t, http: &http.Client{Timeout: 5 * time.Minute}}, nil
+}
+
+func (c *r2Client) call(method, u string, body []byte, headers map[string]string) ([]byte, error) {
+	req, err := http.NewRequest(method, u, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	req.Header.Set("User-Agent", userAgent)
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode >= 300 {
+		var env struct {
+			Errors json.RawMessage `json:"errors"`
+		}
+		detail := string(data)
+		if json.Unmarshal(data, &env) == nil && env.Errors != nil {
+			detail = string(env.Errors)
+		}
+		if len(detail) > 300 {
+			detail = detail[:300]
+		}
+		return nil, fmt.Errorf("%s %s -> HTTP %d: %s", method, u, resp.StatusCode, detail)
+	}
+	return data, nil
+}
+
+func (c *r2Client) list(prefix string) ([]r2Object, error) {
+	var all []r2Object
+	cursor := ""
+	for {
+		q := url.Values{"per_page": {"1000"}}
+		if prefix != "" {
+			q.Set("prefix", prefix)
+		}
+		if cursor != "" {
+			q.Set("cursor", cursor)
+		}
+		data, err := c.call("GET", apiBase+"/objects?"+q.Encode(), nil, nil)
+		if err != nil {
+			return nil, err
+		}
+		var page struct {
+			Result     []r2Object `json:"result"`
+			ResultInfo struct {
+				Cursor      string `json:"cursor"`
+				IsTruncated bool   `json:"is_truncated"`
+			} `json:"result_info"`
+		}
+		if err := json.Unmarshal(data, &page); err != nil {
+			return nil, err
+		}
+		all = append(all, page.Result...)
+		if !page.ResultInfo.IsTruncated || page.ResultInfo.Cursor == "" {
+			return all, nil
+		}
+		cursor = page.ResultInfo.Cursor
+	}
+}
+
+func objectURL(key string) string {
+	return apiBase + "/objects/" + url.PathEscape(key)
+}
+
+func (c *r2Client) put(key string, data []byte, contentType, cacheControl string) error {
+	_, err := c.call("PUT", objectURL(key), data, map[string]string{"Content-Type": contentType, "Cache-Control": cacheControl})
+	return err
+}
+
+func (c *r2Client) delete(key string) error {
+	_, err := c.call("DELETE", objectURL(key), nil, nil)
+	return err
+}
+
+func publicURL(key string) string {
+	parts := strings.Split(key, "/")
+	for i, p := range parts {
+		parts[i] = url.PathEscape(p)
+	}
+	return baseURL + "/" + strings.Join(parts, "/")
+}
+
+func contentType(name string) string {
+	ext := strings.ToLower(filepath.Ext(name))
+	ct := extraTypes[ext]
+	if ct == "" {
+		ct = mime.TypeByExtension(ext)
+	}
+	if ct == "" {
+		ct = "application/octet-stream"
+	}
+	if !strings.Contains(ct, "charset") {
+		for _, p := range textPrefixes {
+			if strings.HasPrefix(ct, p) {
+				return ct + "; charset=utf-8"
+			}
+		}
+	}
+	return ct
+}
+
+func normalizeKey(key string) (string, error) {
+	k := strings.TrimLeft(strings.TrimSpace(key), "/")
+	if k == "" || strings.HasSuffix(k, "/") {
+		return "", fmt.Errorf("invalid key: %q", key)
+	}
+	for _, part := range strings.Split(k, "/") {
+		if part == "" || part == "." || part == ".." {
+			return "", fmt.Errorf("invalid key: %q", key)
+		}
+	}
+	return k, nil
+}
+
+type item struct {
+	path string
+	key  string
+}
+
+func joinKey(prefix, rel string) string {
+	if prefix == "" {
+		return rel
+	}
+	return prefix + "/" + rel
+}
+
+func collect(paths []string, prefix, exactKey string) ([]item, error) {
+	prefix = strings.Trim(prefix, "/")
+	var items []item
+	for _, raw := range paths {
+		info, err := os.Stat(raw)
+		if err != nil {
+			return nil, fmt.Errorf("not found: %s", raw)
+		}
+		if info.IsDir() {
+			err := filepath.WalkDir(raw, func(p string, d fs.DirEntry, err error) error {
+				if err != nil {
+					return err
+				}
+				if skipNames[d.Name()] && p != raw {
+					if d.IsDir() {
+						return filepath.SkipDir
+					}
+					return nil
+				}
+				if !d.Type().IsRegular() {
+					return nil
+				}
+				rel, err := filepath.Rel(raw, p)
+				if err != nil {
+					return err
+				}
+				k, err := normalizeKey(joinKey(prefix, filepath.ToSlash(rel)))
+				if err != nil {
+					return err
+				}
+				items = append(items, item{p, k})
+				return nil
+			})
+			if err != nil {
+				return nil, err
+			}
+			continue
+		}
+		name := exactKey
+		if name == "" {
+			name = joinKey(prefix, filepath.Base(raw))
+		}
+		k, err := normalizeKey(name)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, item{raw, k})
+	}
+	if exactKey != "" && len(items) != 1 {
+		return nil, errors.New("--key needs exactly one file")
+	}
+	seen := map[string]string{}
+	for _, it := range items {
+		if prev, ok := seen[it.key]; ok {
+			return nil, fmt.Errorf("two files map to %s: %s and %s", it.key, prev, it.path)
+		}
+		seen[it.key] = it.path
+	}
+	return items, nil
+}
+
+func commonPrefix(items []item) string {
+	if len(items) == 0 {
+		return ""
+	}
+	p := items[0].key
+	for _, it := range items[1:] {
+		for !strings.HasPrefix(it.key, p) {
+			p = p[:len(p)-1]
+		}
+	}
+	return p
+}
+
+func verify(u string, size int) error {
+	req, _ := http.NewRequest("HEAD", u, nil)
+	req.Header.Set("User-Agent", userAgent)
+	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
+	if err != nil {
+		return fmt.Errorf("verify failed: %s: %w", u, err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("verify failed: %s -> HTTP %d", u, resp.StatusCode)
+	}
+	if resp.ContentLength >= 0 && resp.ContentLength != int64(size) {
+		return fmt.Errorf("verify failed: %s serves %d bytes, expected %d", u, resp.ContentLength, size)
+	}
+	return nil
+}
+
+type putResult struct {
+	Key    string `json:"key"`
+	URL    string `json:"url"`
+	Status string `json:"status"`
+	Bytes  int    `json:"bytes"`
+}
+
+func cmdPut(args []string) error {
+	fl := flag.NewFlagSet("put", flag.ContinueOnError)
+	prefix := fl.StringP("prefix", "p", "", "key prefix, usually a topic dir such as goa2 or kimi-k3")
+	key := fl.StringP("key", "k", "", "exact key for a single file")
+	force := fl.BoolP("force", "f", false, "overwrite keys that exist with different content")
+	ctype := fl.String("content-type", "", "override the detected Content-Type")
+	cache := fl.String("cache-control", defaultCacheControl, "Cache-Control header")
+	dry := fl.BoolP("dry-run", "n", false, "show what would be uploaded")
+	noVerify := fl.Bool("no-verify", false, "skip the public HEAD check after upload")
+	verbose := fl.BoolP("verbose", "v", false, "prefix each URL with its status")
+	asJSON := fl.Bool("json", false, "print a JSON array of {key,url,status,bytes}")
+	fl.Usage = usageFor(fl, "cdn put <files|dirs>... [flags]", "Upload files or directories (recursive, relative paths kept) and print public URLs in input order.")
+	if err := fl.Parse(args); err != nil {
+		return err
+	}
+	if fl.NArg() == 0 {
+		fl.Usage()
+		return errUsage
+	}
+	items, err := collect(fl.Args(), *prefix, *key)
+	if err != nil {
+		return err
+	}
+	c, err := newR2()
+	if err != nil {
+		return err
+	}
+	existing := map[string]r2Object{}
+	if len(items) > 0 {
+		objs, err := c.list(commonPrefix(items))
+		if err != nil {
+			return err
+		}
+		for _, o := range objs {
+			existing[o.Key] = o
+		}
+	}
+	var results []putResult
+	for _, it := range items {
+		data, err := os.ReadFile(it.path)
+		if err != nil {
+			return err
+		}
+		if len(data) > maxUploadBytes {
+			return fmt.Errorf("%s: %d bytes exceeds the 300 MiB REST upload limit", it.path, len(data))
+		}
+		u := publicURL(it.key)
+		sum := md5.Sum(data)
+		old, exists := existing[it.key]
+		var status string
+		switch {
+		case exists && old.ETag == hex.EncodeToString(sum[:]):
+			status = "unchanged"
+		case exists && !*force:
+			return fmt.Errorf("%s already exists with different content. Upload under a new key; --force overwrites, but caches keep serving the old bytes until Cache-Control expires", it.key)
+		default:
+			status = "uploaded"
+			if exists {
+				status = "overwritten"
+			}
+			if !*dry {
+				ct := *ctype
+				if ct == "" {
+					ct = contentType(it.path)
+				}
+				if err := c.put(it.key, data, ct, *cache); err != nil {
+					return err
+				}
+				if !*noVerify {
+					if err := verify(u, len(data)); err != nil {
+						return err
+					}
+				}
+			}
+		}
+		if *dry {
+			status = "would-" + status
+		}
+		results = append(results, putResult{it.key, u, status, len(data)})
+		if !*asJSON {
+			if *verbose {
+				fmt.Printf("%-12s %s\n", status, u)
+			} else {
+				fmt.Println(u)
+			}
+		}
+	}
+	if *asJSON {
+		return printJSON(results)
+	}
+	return nil
+}
+
+func printJSON(v any) error {
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetEscapeHTML(false)
+	enc.SetIndent("", "  ")
+	return enc.Encode(v)
+}
+
+func cmdLs(args []string) error {
+	fl := flag.NewFlagSet("ls", flag.ContinueOnError)
+	asJSON := fl.Bool("json", false, "print JSON")
+	fl.Usage = usageFor(fl, "cdn ls [prefix] [--json]", "List keys under a prefix.")
+	if err := fl.Parse(args); err != nil {
+		return err
+	}
+	c, err := newR2()
+	if err != nil {
+		return err
+	}
+	objs, err := c.list(strings.TrimLeft(fl.Arg(0), "/"))
+	if err != nil {
+		return err
+	}
+	sort.Slice(objs, func(i, j int) bool { return objs[i].Key < objs[j].Key })
+	if *asJSON {
+		type row struct {
+			Key      string `json:"key"`
+			URL      string `json:"url"`
+			Bytes    int64  `json:"bytes"`
+			Uploaded string `json:"uploaded"`
+		}
+		rows := make([]row, 0, len(objs))
+		for _, o := range objs {
+			rows = append(rows, row{o.Key, publicURL(o.Key), o.bytes(), o.LastModified})
+		}
+		return printJSON(rows)
+	}
+	for _, o := range objs {
+		fmt.Printf("%10d  %s\n", o.bytes(), o.Key)
+	}
+	return nil
+}
+
+func cmdRm(args []string) error {
+	fl := flag.NewFlagSet("rm", flag.ContinueOnError)
+	yes := fl.Bool("yes", false, "confirm deletion")
+	fl.Usage = usageFor(fl, "cdn rm <keys>... --yes", "Delete keys.")
+	if err := fl.Parse(args); err != nil {
+		return err
+	}
+	if fl.NArg() == 0 {
+		fl.Usage()
+		return errUsage
+	}
+	if !*yes {
+		return errors.New("rm breaks every page that embeds these URLs; pass --yes to confirm")
+	}
+	c, err := newR2()
+	if err != nil {
+		return err
+	}
+	for _, raw := range fl.Args() {
+		k, err := normalizeKey(raw)
+		if err != nil {
+			return err
+		}
+		if err := c.delete(k); err != nil {
+			return err
+		}
+		fmt.Println("deleted", k)
+	}
+	return nil
+}
+
+func cmdURL(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: cdn url <keys>...")
+	}
+	for _, raw := range args {
+		k, err := normalizeKey(raw)
+		if err != nil {
+			return err
+		}
+		fmt.Println(publicURL(k))
+	}
+	return nil
+}
+
+func rewriteText(s string) (string, int) {
+	n := len(legacyURL.FindAllStringIndex(s, -1))
+	return legacyURL.ReplaceAllLiteralString(s, baseURL+"/"), n
+}
+
+func cmdRewrite(args []string) error {
+	fl := flag.NewFlagSet("rewrite", flag.ContinueOnError)
+	write := fl.BoolP("write", "w", false, "edit files in place")
+	check := fl.Bool("check", false, "exit 1 if any legacy URL is found")
+	fl.Usage = usageFor(fl, "cdn rewrite <files>... [-w] [--check] | cdn rewrite -", "Replace legacy sharosoo/image GitHub/jsDelivr URLs with CDN URLs. `-` filters stdin to stdout.")
+	if err := fl.Parse(args); err != nil {
+		return err
+	}
+	files := fl.Args()
+	if len(files) == 0 {
+		fl.Usage()
+		return errUsage
+	}
+	if len(files) == 1 && files[0] == "-" {
+		data, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			return err
+		}
+		out, _ := rewriteText(string(data))
+		_, err = os.Stdout.WriteString(out)
+		return err
+	}
+	total := 0
+	for _, name := range files {
+		data, err := os.ReadFile(name)
+		if err != nil {
+			return err
+		}
+		out, n := rewriteText(string(data))
+		if n == 0 {
+			continue
+		}
+		total += n
+		fmt.Printf("%4d  %s\n", n, name)
+		if *write {
+			info, _ := os.Stat(name)
+			if err := os.WriteFile(name, []byte(out), info.Mode().Perm()); err != nil {
+				return err
+			}
+		}
+	}
+	if total > 0 && !*write {
+		fmt.Fprintf(os.Stderr, "%d legacy URL(s) found; rerun with --write to apply\n", total)
+	}
+	if *check && total > 0 {
+		return errSilent
+	}
+	return nil
+}
+
+var (
+	errUsage  = errors.New("usage")
+	errSilent = errors.New("")
+)
+
+func usageFor(fl *flag.FlagSet, synopsis, summary string) func() {
+	return func() {
+		fmt.Fprintf(os.Stderr, "usage: %s\n%s\n\n%s", synopsis, summary, fl.FlagUsages())
+	}
+}
+
+const mainUsage = `usage: cdn <command> [args]
+
+Upload to R2 bucket %s served at %s.
+
+commands:
+  put <files|dirs>...   upload and print public URLs
+  ls [prefix]           list keys
+  url <keys>...         print public URLs without uploading
+  rm <keys>... --yes    delete keys
+  rewrite <files>...    replace legacy sharosoo/image URLs with CDN URLs
+  version               print version
+
+Run "cdn <command> --help" for flags.
+`
+
+func main() {
+	if len(os.Args) < 2 {
+		fmt.Fprintf(os.Stderr, mainUsage, bucket, baseURL)
+		os.Exit(2)
+	}
+	cmds := map[string]func([]string) error{
+		"put": cmdPut, "ls": cmdLs, "rm": cmdRm, "url": cmdURL, "rewrite": cmdRewrite,
+	}
+	name, args := os.Args[1], os.Args[2:]
+	switch name {
+	case "version", "--version", "-V":
+		fmt.Println("cdn", version)
+		return
+	case "help", "-h", "--help":
+		fmt.Fprintf(os.Stdout, mainUsage, bucket, baseURL)
+		return
+	}
+	run, ok := cmds[name]
+	if !ok {
+		fmt.Fprintf(os.Stderr, "cdn: unknown command %q\n\n"+mainUsage, name, bucket, baseURL)
+		os.Exit(2)
+	}
+	if err := run(args); err != nil {
+		switch {
+		case errors.Is(err, flag.ErrHelp):
+			return
+		case errors.Is(err, errUsage):
+			os.Exit(2)
+		case errors.Is(err, errSilent):
+			os.Exit(1)
+		}
+		fmt.Fprintln(os.Stderr, "cdn:", err)
+		os.Exit(1)
+	}
+}

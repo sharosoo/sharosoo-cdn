@@ -7,7 +7,8 @@
 - Upload verifies the public URL (HTTP 200, matching size) before returning. Exit code 1 + `cdn: <reason>` on stderr on failure.
 - Idempotent: same content under the same key reports `unchanged`. Different content under an existing key is refused; publish changes under a new key, because objects are cached for one year (`immutable`).
 - Legacy URLs `cdn.jsdelivr.net/gh/sharosoo/image@<ref>/<path>`, `raw.githubusercontent.com/sharosoo/image/<ref>/<path>` and `github.com/sharosoo/image/{raw,blob}/<ref>/<path>` are retired; the same `<path>` exists on the CDN. Convert text with `cdn rewrite <files> --write` or `cdn rewrite - < in > out`.
-- Other: `cdn ls [prefix]`, `cdn url <key>`, `cdn rm <key> --yes`.
+- Other: `cdn ls [prefix]`, `cdn url <key>`, `cdn rm <key> --yes` (never reuse a deleted key; edge caches keep old bytes), `cdn version`.
 - Limits: 300 MiB per file; everything is public; CORS allows GET/HEAD from any origin.
-- Auth: wrangler OAuth login (auto-refreshed) or `CDN_CLOUDFLARE_API_TOKEN`.
+- Install: `curl -fsSL https://cdn.sharosoo.com/tools/cdn/install.sh | sh` → static binary in `~/.local/bin/cdn` (Linux/macOS amd64/arm64; Windows `.exe` under `https://cdn.sharosoo.com/tools/cdn/v<version>/`).
+- Auth: `CDN_CLOUDFLARE_API_TOKEN` (R2 edit) or the wrangler OAuth login (auto-refreshed).
 - Infra (bucket, domain, CORS) is Terraform in github.com/sharosoo/infra, `cloudflare/cdn.tf`.

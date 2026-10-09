@@ -35,12 +35,14 @@ cdn ls goa2/                       # list keys under a prefix (--json for machin
 cdn url goa2/board.png             # print a URL without uploading
 cdn rewrite post.md --write        # replace legacy sharosoo/image jsDelivr/GitHub URLs with cdn.sharosoo.com
 cdn rewrite - < in.md > out.md     # same, stdin → stdout
-cdn rm goa2/old.png --yes          # delete (breaks every page that embeds it)
+cdn rm goa2/old.png --yes          # delete (breaks every page that embeds it; never reuse the key, edge caches keep the old bytes)
 ```
 
-## Auth
+## Install and auth
 
-Uses the wrangler OAuth login (`bunx wrangler login`) and refreshes it automatically; `CDN_CLOUDFLARE_API_TOKEN` overrides it with a token that has R2 write on account `93b84e89…`. If `cdn` is missing: `uv tool install --editable ~/workspaces/sharosoo/cdn`.
+If `cdn` is missing: `curl -fsSL https://cdn.sharosoo.com/tools/cdn/install.sh | sh` (static binary into `~/.local/bin`; Linux/macOS, amd64/arm64).
+
+Auth: `CDN_CLOUDFLARE_API_TOKEN` (Cloudflare token with R2 edit on account `93b84e89…`) if set, otherwise the wrangler OAuth login (`bunx wrangler login`), refreshed automatically.
 
 ## Limits
 
