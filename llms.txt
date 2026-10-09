@@ -1,0 +1,13 @@
+# cdn.sharosoo.com
+
+> Public static file hosting for sharosoo. Cloudflare R2 bucket `sharosoo-cdn` behind the custom domain `cdn.sharosoo.com`. Upload with the `cdn` CLI; embed the printed URL.
+
+- URL form: `https://cdn.sharosoo.com/<topic>/<file>`; topic is a kebab-case slug per article/project; screenshots under `screenshots/`.
+- Upload: `cdn put <files|dirs> --prefix <topic>` prints one URL per line (input order); `--json` prints `[{key,url,status,bytes}]`; `--key <key>` for one exact key; `--dry-run` previews.
+- Upload verifies the public URL (HTTP 200, matching size) before returning. Exit code 1 + `cdn: <reason>` on stderr on failure.
+- Idempotent: same content under the same key reports `unchanged`. Different content under an existing key is refused; publish changes under a new key, because objects are cached for one year (`immutable`).
+- Legacy URLs `cdn.jsdelivr.net/gh/sharosoo/image@<ref>/<path>`, `raw.githubusercontent.com/sharosoo/image/<ref>/<path>` and `github.com/sharosoo/image/{raw,blob}/<ref>/<path>` are retired; the same `<path>` exists on the CDN. Convert text with `cdn rewrite <files> --write` or `cdn rewrite - < in > out`.
+- Other: `cdn ls [prefix]`, `cdn url <key>`, `cdn rm <key> --yes`.
+- Limits: 300 MiB per file; everything is public; CORS allows GET/HEAD from any origin.
+- Auth: wrangler OAuth login (auto-refreshed) or `CDN_CLOUDFLARE_API_TOKEN`.
+- Infra (bucket, domain, CORS) is Terraform in github.com/sharosoo/infra, `cloudflare/cdn.tf`.
