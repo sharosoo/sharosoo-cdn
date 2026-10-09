@@ -1,75 +1,70 @@
-# cdn
+# sharosoo-cdn
 
-`cdn` uploads files to Cloudflare R2 bucket `sharosoo-cdn` and prints their public URLs on `https://cdn.sharosoo.com`.
+Upload files to `https://cdn.sharosoo.com` (Cloudflare R2 bucket `sharosoo-cdn`) and print their URLs.
 
-The bucket, custom domain and CORS are defined in [sharosoo/infra](https://github.com/sharosoo/infra) (`cloudflare/cdn.tf`). This repo is only the client.
+Infrastructure: [sharosoo/infra](https://github.com/sharosoo/infra).
 
 ## Install
 
-Single static binary (Go, no runtime) for Linux/macOS/Windows on amd64/arm64, hosted on the CDN itself:
-
 ```sh
-curl -fsSL https://cdn.sharosoo.com/tools/cdn/install.sh | sh     # → ~/.local/bin/cdn
-CDN_VERSION=0.2.0 CDN_INSTALL_DIR=/usr/local/bin sh -c "$(curl -fsSL https://cdn.sharosoo.com/tools/cdn/install.sh)"
+curl -fsSL https://cdn.sharosoo.com/tools/sharosoo-cdn/install.sh | sh
 ```
 
-The installer picks `cdn-<os>-<arch>` from `https://cdn.sharosoo.com/tools/cdn/v<version>/` and checks it against `SHA256SUMS`. Windows: download `cdn-windows-amd64.exe` from the same directory.
+Static binary for Linux and macOS (amd64, arm64), installed to `~/.local/bin/sharosoo-cdn`. Override with `SHAROSOO_CDN_INSTALL_DIR`, pin with `SHAROSOO_CDN_VERSION`. Windows: `https://cdn.sharosoo.com/tools/sharosoo-cdn/v<version>/sharosoo-cdn-windows-<arch>.exe`.
 
-From a checkout: `go build -o ~/.local/bin/cdn .`.
+## Log in
 
-### Authentication
+```sh
+sharosoo-cdn login
+```
 
-1. `CDN_CLOUDFLARE_API_TOKEN`: a Cloudflare API token with *Workers R2 Storage: Edit* on account `93b84e89…`. Use this on servers, CI and machines without wrangler.
-2. Otherwise the wrangler OAuth login (`bunx wrangler login`). An expired token is refreshed by running wrangler once (`bunx` or `npx` must be on `PATH`).
+Opens the Cloudflare dashboard with a pre-filled token form (Account › Workers R2 Storage: Edit, Zone › Cache Purge: Purge). Create the token, paste it back, and the CLI checks it and saves it to `<user config dir>/sharosoo-cdn/token` (mode 0600).
+
+Without a browser (SSH, servers, containers), `login` prints the URL and a QR code; create the token on any other device and paste it. Non-interactive:
+
+```sh
+echo "$TOKEN" | sharosoo-cdn login --with-token
+SHAROSOO_CDN_TOKEN=... sharosoo-cdn put ...   # env overrides the saved token
+```
+
+`sharosoo-cdn status` re-checks the token; `sharosoo-cdn logout` deletes it.
 
 ## Usage
 
 ```sh
-cdn put fig.png --prefix my-article          # https://cdn.sharosoo.com/my-article/fig.png
-cdn put ./figures --prefix my-article        # recursive, keeps relative paths
-cdn put shot.png --key screenshots/x.png     # exact key
-cdn put ./figures --prefix my-article --json --dry-run
-cdn ls my-article/
-cdn url my-article/fig.png
-cdn rewrite notes.md --write                 # legacy sharosoo/image URLs → cdn.sharosoo.com
-cdn rm my-article/fig.png --yes
+sharosoo-cdn put fig.png --prefix my-post        # https://cdn.sharosoo.com/my-post/fig.png
+sharosoo-cdn put ./figures --prefix my-post      # recursive, keeps relative paths
+sharosoo-cdn put shot.png --key screenshots/x.png
+sharosoo-cdn put fig.png --prefix my-post --force   # overwrite and purge the edge cache
+sharosoo-cdn ls my-post/
+sharosoo-cdn url my-post/fig.png
+sharosoo-cdn rm my-post/fig.png --yes            # delete and purge
+sharosoo-cdn rewrite post.md --write             # old sharosoo/image GitHub/jsDelivr URLs → cdn.sharosoo.com
 ```
 
-### Behavior
-
-|Case|Result|
-|---|---|
-|Key absent|upload, then HEAD the public URL (200 and matching size)|
-|Key present, same MD5|`unchanged`, nothing uploaded|
-|Key present, different content|error; `--force` overwrites|
-|Directory input|every file below it, `.git`/`__pycache__`/`.DS_Store` skipped|
-
-Objects get `Cache-Control: public, max-age=31536000, immutable` (override with `--cache-control`). Treat keys as immutable: publish changed content under a new key. The same applies after `cdn rm`: re-uploading a deleted key can serve the old bytes from the edge cache. `Content-Type` comes from the extension (`webp`, `avif`, `svg`, `woff2`, `md` covered); text types get `charset=utf-8`.
-
-`cdn rewrite` maps these legacy URLs to `https://cdn.sharosoo.com/<path>`:
-
-- `https://cdn.jsdelivr.net/gh/sharosoo/image@<ref>/<path>`
-- `https://raw.githubusercontent.com/sharosoo/image/<ref>/<path>`
-- `https://github.com/sharosoo/image/{raw,blob}/<ref>/<path>`
+- `put` verifies each public URL (HTTP 200, matching size). Unchanged files are skipped. Different content under an existing key needs `--force`.
+- `Cache-Control` defaults to `public, max-age=86400`. The edge caches for a year and is purged on `--force` and `rm`, so browsers may show an old file for up to a day.
+- `--json` prints `[{key,url,status,bytes}]`; `--dry-run` uploads nothing.
+- 300 MiB per file. Everything uploaded is public.
 
 ## Configuration
 
 |Env|Default|
 |---|---|
-|`CDN_CLOUDFLARE_API_TOKEN`|wrangler OAuth token|
-|`CDN_ACCOUNT_ID`|`93b84e890d66e1c2c6890b27c1e3b96b`|
-|`CDN_BUCKET`|`sharosoo-cdn`|
-|`CDN_BASE_URL`|`https://cdn.sharosoo.com`|
+|`SHAROSOO_CDN_TOKEN`|saved token|
+|`SHAROSOO_CDN_ACCOUNT_ID`|`93b84e890d66e1c2c6890b27c1e3b96b`|
+|`SHAROSOO_CDN_ZONE_ID`|`fe8e9c88bba292dd12402cd4e3548c49`|
+|`SHAROSOO_CDN_BUCKET`|`sharosoo-cdn`|
+|`SHAROSOO_CDN_BASE_URL`|`https://cdn.sharosoo.com`|
 
 ## Release
 
 ```sh
-scripts/release.sh 0.3.0
+scripts/release.sh 0.4.0
 ```
 
-Needs a clean tree. Runs `go vet` and `go test`, cross-builds six targets with `CGO_ENABLED=0`, uploads them with the freshly built binary to `tools/cdn/v<version>/` plus `SHA256SUMS`, updates `tools/cdn/latest` and `tools/cdn/install.sh` (60 s cache), then tags and pushes `v<version>`.
+Requires a clean tree, Go and a logged-in CLI. Tests, cross-builds six targets, uploads them to `tools/sharosoo-cdn/v<version>/` with `SHA256SUMS`, updates `latest` and `install.sh`, then tags `v<version>` and pushes the tag.
 
-## For agents
+## Agents
 
-- [`skills/cdn/SKILL.md`](skills/cdn/SKILL.md): agent skill, symlinked into `~/.agents/skills`, `~/.claude/skills` and `~/.hermes/skills`.
-- [`llms.txt`](llms.txt): short reference for LLM context.
+[`skills/sharosoo-cdn/SKILL.md`](skills/sharosoo-cdn/SKILL.md) is an agent skill; [`llms.txt`](llms.txt) is a short reference.

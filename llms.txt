@@ -1,14 +1,12 @@
-# cdn.sharosoo.com
+# sharosoo-cdn
 
-> Public static file hosting for sharosoo. Cloudflare R2 bucket `sharosoo-cdn` behind the custom domain `cdn.sharosoo.com`. Upload with the `cdn` CLI; embed the printed URL.
+> Public static hosting: Cloudflare R2 bucket `sharosoo-cdn` at `https://cdn.sharosoo.com/<key>`. Upload with the `sharosoo-cdn` CLI and embed the printed URL.
 
-- URL form: `https://cdn.sharosoo.com/<topic>/<file>`; topic is a kebab-case slug per article/project; screenshots under `screenshots/`.
-- Upload: `cdn put <files|dirs> --prefix <topic>` prints one URL per line (input order); `--json` prints `[{key,url,status,bytes}]`; `--key <key>` for one exact key; `--dry-run` previews.
-- Upload verifies the public URL (HTTP 200, matching size) before returning. Exit code 1 + `cdn: <reason>` on stderr on failure.
-- Idempotent: same content under the same key reports `unchanged`. Different content under an existing key is refused; publish changes under a new key, because objects are cached for one year (`immutable`).
-- Legacy URLs `cdn.jsdelivr.net/gh/sharosoo/image@<ref>/<path>`, `raw.githubusercontent.com/sharosoo/image/<ref>/<path>` and `github.com/sharosoo/image/{raw,blob}/<ref>/<path>` are retired; the same `<path>` exists on the CDN. Convert text with `cdn rewrite <files> --write` or `cdn rewrite - < in > out`.
-- Other: `cdn ls [prefix]`, `cdn url <key>`, `cdn rm <key> --yes` (never reuse a deleted key; edge caches keep old bytes), `cdn version`.
+- Install: `curl -fsSL https://cdn.sharosoo.com/tools/sharosoo-cdn/install.sh | sh`
+- Auth: `sharosoo-cdn login` (browser, or URL + QR code when headless) saves a Cloudflare API token; `echo $T | sharosoo-cdn login --with-token` for scripts; `SHAROSOO_CDN_TOKEN` overrides. Permissions: Account › Workers R2 Storage: Edit; Zone › Cache Purge: Purge. `sharosoo-cdn status` checks it.
+- `sharosoo-cdn put <files|dirs> --prefix <topic>`: one URL per line, input order. `--key <key>` for one exact key, `--json` for `[{key,url,status,bytes}]`, `--dry-run` to preview.
+- `put` verifies HTTP 200 and size. Same content → `unchanged`. Different content under an existing key → error unless `--force`, which overwrites and purges the edge.
+- `sharosoo-cdn rm <key>... --yes` deletes and purges. `sharosoo-cdn ls [prefix]`, `sharosoo-cdn url <key>`.
+- Old `cdn.jsdelivr.net/gh/sharosoo/image@<ref>/<path>` and `raw.githubusercontent.com/sharosoo/image/<ref>/<path>` URLs map to `https://cdn.sharosoo.com/<path>`; convert with `sharosoo-cdn rewrite <files> --write`.
+- Key layout: `<topic>/<file>`, kebab-case topic; screenshots under `screenshots/`.
 - Limits: 300 MiB per file; everything is public; CORS allows GET/HEAD from any origin.
-- Install: `curl -fsSL https://cdn.sharosoo.com/tools/cdn/install.sh | sh` → static binary in `~/.local/bin/cdn` (Linux/macOS amd64/arm64; Windows `.exe` under `https://cdn.sharosoo.com/tools/cdn/v<version>/`).
-- Auth: `CDN_CLOUDFLARE_API_TOKEN` (R2 edit) or the wrangler OAuth login (auto-refreshed).
-- Infra (bucket, domain, CORS) is Terraform in github.com/sharosoo/infra, `cloudflare/cdn.tf`.

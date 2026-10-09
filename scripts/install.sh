@@ -1,11 +1,11 @@
 #!/bin/sh
-# Install the cdn CLI from cdn.sharosoo.com.
-#   curl -fsSL https://cdn.sharosoo.com/tools/cdn/install.sh | sh
-# Env: CDN_VERSION (default: latest), CDN_INSTALL_DIR (default: ~/.local/bin).
+# Install the sharosoo-cdn CLI from cdn.sharosoo.com.
+#   curl -fsSL https://cdn.sharosoo.com/tools/sharosoo-cdn/install.sh | sh
+# Env: SHAROSOO_CDN_VERSION (default: latest), SHAROSOO_CDN_INSTALL_DIR (default: ~/.local/bin).
 set -eu
 
-base="https://cdn.sharosoo.com/tools/cdn"
-dir="${CDN_INSTALL_DIR:-$HOME/.local/bin}"
+base="https://cdn.sharosoo.com/tools/sharosoo-cdn"
+dir="${SHAROSOO_CDN_INSTALL_DIR:-$HOME/.local/bin}"
 
 fetch() {
   if command -v curl >/dev/null 2>&1; then curl -fsSL -A sharosoo-cdn-install "$1"
@@ -23,9 +23,9 @@ case "$(uname -m)" in
   *) echo "unsupported architecture $(uname -m)" >&2; exit 1 ;;
 esac
 
-version="${CDN_VERSION:-$(fetch "$base/latest")}"
+version="${SHAROSOO_CDN_VERSION:-$(fetch "$base/latest")}"
 version="${version#v}"
-name="cdn-$os-$arch"
+name="sharosoo-cdn-$os-$arch"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
@@ -39,6 +39,6 @@ fetch "$base/v$version/SHA256SUMS" > "$tmp/SHA256SUMS"
 ) || { echo "checksum mismatch for $name" >&2; exit 1; }
 
 mkdir -p "$dir"
-install -m 0755 "$tmp/$name" "$dir/cdn"
-echo "installed cdn $version to $dir/cdn"
+install -m 0755 "$tmp/$name" "$dir/sharosoo-cdn"
+echo "installed sharosoo-cdn $version to $dir/sharosoo-cdn"
 case ":$PATH:" in *":$dir:"*) ;; *) echo "note: $dir is not on PATH" >&2 ;; esac
