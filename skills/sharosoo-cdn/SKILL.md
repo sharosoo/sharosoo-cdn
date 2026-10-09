@@ -7,7 +7,7 @@ description: Use when an image, screenshot, figure, font or other static file ne
 
 Public static hosting backed by Cloudflare R2. URLs look like `https://cdn.sharosoo.com/<topic>/<file>`.
 
-Never commit files to `github.com/sharosoo/image` or emit `cdn.jsdelivr.net/gh/sharosoo/image@…` / `raw.githubusercontent.com/sharosoo/image/…` URLs. That repo is archived; its files live on the CDN under the same paths.
+Never emit `cdn.jsdelivr.net/gh/sharosoo/image@…` or `raw.githubusercontent.com/sharosoo/image/…` URLs. That repo is deleted; its files live on the CDN under the same paths (`sharosoo-cdn rewrite` converts old links).
 
 ## Upload
 
