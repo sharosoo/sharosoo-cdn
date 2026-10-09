@@ -1,8 +1,7 @@
-// Command cdn uploads files to the R2 bucket sharosoo-cdn and prints their https://cdn.sharosoo.com URLs.
+// Command sharosoo-cdn uploads files to the R2 bucket sharosoo-cdn and prints their https://cdn.sharosoo.com URLs.
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"crypto/md5"
 	"encoding/hex"
@@ -15,7 +14,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -29,10 +27,14 @@ import (
 var version = "dev"
 
 const (
-	defaultAccountID    = "93b84e890d66e1c2c6890b27c1e3b96b"
-	defaultBucket       = "sharosoo-cdn"
-	defaultBaseURL      = "https://cdn.sharosoo.com"
-	defaultCacheControl = "public, max-age=31536000, immutable"
+	defaultAccountID = "93b84e890d66e1c2c6890b27c1e3b96b"
+	defaultZoneID    = "fe8e9c88bba292dd12402cd4e3548c49"
+	defaultBucket    = "sharosoo-cdn"
+	defaultBaseURL   = "https://cdn.sharosoo.com"
+	// Browser TTL only; the edge keeps objects for a year via a cache rule and is purged on overwrite/delete.
+	defaultCacheControl = "public, max-age=86400"
+	// purge_cache takes at most 30 URLs per request outside Enterprise plans.
+	purgeBatch = 30
 	// Cloudflare REST object upload limit; larger files need the S3 API multipart upload.
 	maxUploadBytes = 300 << 20
 	// Cloudflare bot protection rejects some default client user agents with 403.
@@ -40,10 +42,12 @@ const (
 )
 
 var (
-	accountID = envOr("CDN_ACCOUNT_ID", defaultAccountID)
-	bucket    = envOr("CDN_BUCKET", defaultBucket)
-	baseURL   = strings.TrimRight(envOr("CDN_BASE_URL", defaultBaseURL), "/")
-	apiBase   = fmt.Sprintf("https://api.cloudflare.com/client/v4/accounts/%s/r2/buckets/%s", accountID, bucket)
+	accountID = envOr("SHAROSOO_CDN_ACCOUNT_ID", defaultAccountID)
+	zoneID    = envOr("SHAROSOO_CDN_ZONE_ID", defaultZoneID)
+	bucket    = envOr("SHAROSOO_CDN_BUCKET", defaultBucket)
+	baseURL   = strings.TrimRight(envOr("SHAROSOO_CDN_BASE_URL", defaultBaseURL), "/")
+	apiRoot   = "https://api.cloudflare.com/client/v4"
+	apiBase   = fmt.Sprintf("%s/accounts/%s/r2/buckets/%s", apiRoot, accountID, bucket)
 
 	skipNames = map[string]bool{".git": true, ".DS_Store": true, "Thumbs.db": true, "__pycache__": true}
 
@@ -70,93 +74,6 @@ func envOr(key, fallback string) string {
 		return v
 	}
 	return fallback
-}
-
-func wranglerConfigPath() string {
-	home, _ := os.UserHomeDir()
-	var dirs []string
-	if x := os.Getenv("XDG_CONFIG_HOME"); x != "" {
-		dirs = append(dirs, x)
-	}
-	dirs = append(dirs, filepath.Join(home, ".config"), filepath.Join(home, "Library", "Preferences"))
-	if a := os.Getenv("APPDATA"); a != "" {
-		dirs = append(dirs, a)
-	}
-	dirs = append(dirs, home)
-	for _, d := range dirs {
-		p := filepath.Join(d, ".wrangler", "config", "default.toml")
-		if _, err := os.Stat(p); err == nil {
-			return p
-		}
-	}
-	return ""
-}
-
-// readWranglerConfig parses the flat `key = "value"` lines wrangler writes.
-func readWranglerConfig(p string) (map[string]string, error) {
-	f, err := os.Open(p)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	out := map[string]string{}
-	sc := bufio.NewScanner(f)
-	for sc.Scan() {
-		k, v, ok := strings.Cut(sc.Text(), "=")
-		if !ok {
-			continue
-		}
-		v = strings.TrimSpace(v)
-		if s, err := strconv.Unquote(v); err == nil {
-			out[strings.TrimSpace(k)] = s
-		}
-	}
-	return out, sc.Err()
-}
-
-func refreshWranglerLogin() error {
-	// Any authenticated wrangler call rotates an expired OAuth token and rewrites the config file.
-	for _, runner := range [][]string{{"bunx", "wrangler"}, {"npx", "--yes", "wrangler"}} {
-		if _, err := exec.LookPath(runner[0]); err != nil {
-			continue
-		}
-		cmd := exec.Command(runner[0], append(runner[1:], "r2", "bucket", "list")...)
-		cmd.Env = append(os.Environ(), "CLOUDFLARE_ACCOUNT_ID="+accountID)
-		var stderr bytes.Buffer
-		cmd.Stderr = &stderr
-		if err := cmd.Run(); err != nil {
-			return fmt.Errorf("wrangler token refresh failed (run: bunx wrangler login)\n%s", strings.TrimSpace(stderr.String()))
-		}
-		return nil
-	}
-	return errors.New("wrangler token expired and neither bunx nor npx is available to refresh it")
-}
-
-func apiToken() (string, error) {
-	if t := os.Getenv("CDN_CLOUDFLARE_API_TOKEN"); t != "" {
-		return t, nil
-	}
-	p := wranglerConfigPath()
-	if p == "" {
-		return "", errors.New("no CDN_CLOUDFLARE_API_TOKEN and no wrangler login (run: bunx wrangler login)")
-	}
-	cfg, err := readWranglerConfig(p)
-	if err != nil {
-		return "", err
-	}
-	expires, err := time.Parse(time.RFC3339, cfg["expiration_time"])
-	if err != nil || time.Until(expires) < 2*time.Minute {
-		if err := refreshWranglerLogin(); err != nil {
-			return "", err
-		}
-		if cfg, err = readWranglerConfig(p); err != nil {
-			return "", err
-		}
-	}
-	if cfg["oauth_token"] == "" {
-		return "", fmt.Errorf("no oauth_token in %s (run: bunx wrangler login)", p)
-	}
-	return cfg["oauth_token"], nil
 }
 
 type r2Client struct {
@@ -265,6 +182,18 @@ func (c *r2Client) put(key string, data []byte, contentType, cacheControl string
 func (c *r2Client) delete(key string) error {
 	_, err := c.call("DELETE", objectURL(key), nil, nil)
 	return err
+}
+
+// purge evicts URLs from the Cloudflare edge so overwritten or deleted keys stop serving old bytes.
+func (c *r2Client) purge(urls []string) error {
+	for start := 0; start < len(urls); start += purgeBatch {
+		end := min(start+purgeBatch, len(urls))
+		body, _ := json.Marshal(map[string][]string{"files": urls[start:end]})
+		if _, err := c.call("POST", fmt.Sprintf("%s/zones/%s/purge_cache", apiRoot, zoneID), body, map[string]string{"Content-Type": "application/json"}); err != nil {
+			return fmt.Errorf("cache purge failed (token needs Zone > Cache Purge): %w", err)
+		}
+	}
+	return nil
 }
 
 func publicURL(key string) string {
@@ -393,21 +322,30 @@ func commonPrefix(items []item) string {
 	return p
 }
 
+// verify HEADs the public URL. Retries cover purge propagation after an overwrite.
 func verify(u string, size int) error {
-	req, _ := http.NewRequest("HEAD", u, nil)
-	req.Header.Set("User-Agent", userAgent)
-	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
-	if err != nil {
-		return fmt.Errorf("verify failed: %s: %w", u, err)
+	var last error
+	for attempt := range 5 {
+		if attempt > 0 {
+			time.Sleep(2 * time.Second)
+		}
+		req, _ := http.NewRequest("HEAD", u, nil)
+		req.Header.Set("User-Agent", userAgent)
+		resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
+		if err != nil {
+			return fmt.Errorf("verify failed: %s: %w", u, err)
+		}
+		resp.Body.Close()
+		switch {
+		case resp.StatusCode != 200:
+			last = fmt.Errorf("verify failed: %s -> HTTP %d", u, resp.StatusCode)
+		case resp.ContentLength >= 0 && resp.ContentLength != int64(size):
+			last = fmt.Errorf("verify failed: %s serves %d bytes, expected %d", u, resp.ContentLength, size)
+		default:
+			return nil
+		}
 	}
-	resp.Body.Close()
-	if resp.StatusCode != 200 {
-		return fmt.Errorf("verify failed: %s -> HTTP %d", u, resp.StatusCode)
-	}
-	if resp.ContentLength >= 0 && resp.ContentLength != int64(size) {
-		return fmt.Errorf("verify failed: %s serves %d bytes, expected %d", u, resp.ContentLength, size)
-	}
-	return nil
+	return last
 }
 
 type putResult struct {
@@ -428,7 +366,7 @@ func cmdPut(args []string) error {
 	noVerify := fl.Bool("no-verify", false, "skip the public HEAD check after upload")
 	verbose := fl.BoolP("verbose", "v", false, "prefix each URL with its status")
 	asJSON := fl.Bool("json", false, "print a JSON array of {key,url,status,bytes}")
-	fl.Usage = usageFor(fl, "cdn put <files|dirs>... [flags]", "Upload files or directories (recursive, relative paths kept) and print public URLs in input order.")
+	fl.Usage = usageFor(fl, "sharosoo-cdn put <files|dirs>... [flags]", "Upload files or directories (recursive, relative paths kept) and print public URLs in input order.")
 	if err := fl.Parse(args); err != nil {
 		return err
 	}
@@ -471,7 +409,7 @@ func cmdPut(args []string) error {
 		case exists && old.ETag == hex.EncodeToString(sum[:]):
 			status = "unchanged"
 		case exists && !*force:
-			return fmt.Errorf("%s already exists with different content. Upload under a new key; --force overwrites, but caches keep serving the old bytes until Cache-Control expires", it.key)
+			return fmt.Errorf("%s already exists with different content; pass --force to overwrite (the edge cache is purged, browsers may keep the old file until Cache-Control expires)", it.key)
 		default:
 			status = "uploaded"
 			if exists {
@@ -484,6 +422,11 @@ func cmdPut(args []string) error {
 				}
 				if err := c.put(it.key, data, ct, *cache); err != nil {
 					return err
+				}
+				if exists {
+					if err := c.purge([]string{u}); err != nil {
+						return err
+					}
 				}
 				if !*noVerify {
 					if err := verify(u, len(data)); err != nil {
@@ -520,7 +463,7 @@ func printJSON(v any) error {
 func cmdLs(args []string) error {
 	fl := flag.NewFlagSet("ls", flag.ContinueOnError)
 	asJSON := fl.Bool("json", false, "print JSON")
-	fl.Usage = usageFor(fl, "cdn ls [prefix] [--json]", "List keys under a prefix.")
+	fl.Usage = usageFor(fl, "sharosoo-cdn ls [prefix] [--json]", "List keys under a prefix.")
 	if err := fl.Parse(args); err != nil {
 		return err
 	}
@@ -555,7 +498,7 @@ func cmdLs(args []string) error {
 func cmdRm(args []string) error {
 	fl := flag.NewFlagSet("rm", flag.ContinueOnError)
 	yes := fl.Bool("yes", false, "confirm deletion")
-	fl.Usage = usageFor(fl, "cdn rm <keys>... --yes", "Delete keys.")
+	fl.Usage = usageFor(fl, "sharosoo-cdn rm <keys>... --yes", "Delete keys.")
 	if err := fl.Parse(args); err != nil {
 		return err
 	}
@@ -570,6 +513,7 @@ func cmdRm(args []string) error {
 	if err != nil {
 		return err
 	}
+	var urls []string
 	for _, raw := range fl.Args() {
 		k, err := normalizeKey(raw)
 		if err != nil {
@@ -579,13 +523,14 @@ func cmdRm(args []string) error {
 			return err
 		}
 		fmt.Println("deleted", k)
+		urls = append(urls, publicURL(k))
 	}
-	return nil
+	return c.purge(urls)
 }
 
 func cmdURL(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: cdn url <keys>...")
+		return fmt.Errorf("usage: sharosoo-cdn url <keys>...")
 	}
 	for _, raw := range args {
 		k, err := normalizeKey(raw)
@@ -606,7 +551,7 @@ func cmdRewrite(args []string) error {
 	fl := flag.NewFlagSet("rewrite", flag.ContinueOnError)
 	write := fl.BoolP("write", "w", false, "edit files in place")
 	check := fl.Bool("check", false, "exit 1 if any legacy URL is found")
-	fl.Usage = usageFor(fl, "cdn rewrite <files>... [-w] [--check] | cdn rewrite -", "Replace legacy sharosoo/image GitHub/jsDelivr URLs with CDN URLs. `-` filters stdin to stdout.")
+	fl.Usage = usageFor(fl, "sharosoo-cdn rewrite <files>... [-w] [--check] | sharosoo-cdn rewrite -", "Replace legacy sharosoo/image GitHub/jsDelivr URLs with CDN URLs. `-` filters stdin to stdout.")
 	if err := fl.Parse(args); err != nil {
 		return err
 	}
@@ -663,11 +608,14 @@ func usageFor(fl *flag.FlagSet, synopsis, summary string) func() {
 	}
 }
 
-const mainUsage = `usage: cdn <command> [args]
+const mainUsage = `usage: sharosoo-cdn <command> [args]
 
 Upload to R2 bucket %s served at %s.
 
 commands:
+  login                 create and save an API token (opens the Cloudflare dashboard or prints a QR code)
+  logout                delete the saved token
+  status                check the token and its permissions
   put <files|dirs>...   upload and print public URLs
   ls [prefix]           list keys
   url <keys>...         print public URLs without uploading
@@ -675,7 +623,7 @@ commands:
   rewrite <files>...    replace legacy sharosoo/image URLs with CDN URLs
   version               print version
 
-Run "cdn <command> --help" for flags.
+Run "sharosoo-cdn <command> --help" for flags.
 `
 
 func main() {
@@ -685,11 +633,12 @@ func main() {
 	}
 	cmds := map[string]func([]string) error{
 		"put": cmdPut, "ls": cmdLs, "rm": cmdRm, "url": cmdURL, "rewrite": cmdRewrite,
+		"login": cmdLogin, "logout": cmdLogout, "status": cmdStatus,
 	}
 	name, args := os.Args[1], os.Args[2:]
 	switch name {
 	case "version", "--version", "-V":
-		fmt.Println("cdn", version)
+		fmt.Println("sharosoo-cdn", version)
 		return
 	case "help", "-h", "--help":
 		fmt.Fprintf(os.Stdout, mainUsage, bucket, baseURL)
@@ -697,7 +646,7 @@ func main() {
 	}
 	run, ok := cmds[name]
 	if !ok {
-		fmt.Fprintf(os.Stderr, "cdn: unknown command %q\n\n"+mainUsage, name, bucket, baseURL)
+		fmt.Fprintf(os.Stderr, "sharosoo-cdn: unknown command %q\n\n"+mainUsage, name, bucket, baseURL)
 		os.Exit(2)
 	}
 	if err := run(args); err != nil {
@@ -709,7 +658,7 @@ func main() {
 		case errors.Is(err, errSilent):
 			os.Exit(1)
 		}
-		fmt.Fprintln(os.Stderr, "cdn:", err)
+		fmt.Fprintln(os.Stderr, "sharosoo-cdn:", err)
 		os.Exit(1)
 	}
 }
